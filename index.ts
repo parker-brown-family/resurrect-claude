@@ -30,36 +30,43 @@ import {
   statSync,
   existsSync,
   copyFileSync,
+  openSync,
+  readSync,
+  closeSync,
 } from "fs";
 import { join } from "path";
 import { spawnSync } from "child_process";
 import { homedir } from "os";
 
-const CLEARED = "[Old tool result content cleared]";
+export const CLEARED = "[Old tool result content cleared]";
 const CLAUDE_PROJECTS = join(homedir(), ".claude", "projects");
+
+// Only read this many bytes when checking if a session is interactive.
+// A single JSONL line with a text user turn is well under 4 KB.
+const INTERACTIVE_SCAN_BYTES = 4096;
 
 // -- Types --------------------------------------------------------------------
 
-interface ToolUseBlock {
+export interface ToolUseBlock {
   type: "tool_use";
   id: string;
   name: string;
   input: Record<string, unknown>;
 }
 
-interface ToolResultBlock {
+export interface ToolResultBlock {
   type: "tool_result";
   tool_use_id: string;
   content: string | unknown[];
   [k: string]: unknown;
 }
 
-type ContentBlock =
+export type ContentBlock =
   | ToolUseBlock
   | ToolResultBlock
   | { type: string; [k: string]: unknown };
 
-interface SessionLine {
+export interface SessionLine {
   type?: string;
   message?: { role: string; content: string | ContentBlock[] };
   [k: string]: unknown;
@@ -71,7 +78,7 @@ interface SessionLine {
  * Run a command with an explicit argument list — no shell interpolation.
  * Stdout and stderr are combined; non-zero exit is surfaced in the output.
  */
-function runCommand(
+export function runCommand(
   cmd: string,
   args: string[],
   timeoutMs = 15_000,
@@ -97,9 +104,29 @@ function runCommand(
   return out || err;
 }
 
+// -- HTML stripping -----------------------------------------------------------
+
+/**
+ * Strip HTML markup from a raw fetch response so the model sees readable
+ * text rather than raw tags. Exported for unit testing.
+ */
+export function stripHtml(raw: string): string {
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 50_000);
+}
+
 // -- Tool execution -----------------------------------------------------------
 
-async function executeTool(
+export async function executeTool(
   name: string,
   input: Record<string, unknown>,
   opts: { bash: boolean },
@@ -124,8 +151,8 @@ async function executeTool(
         typeof input.timeout === "number"
           ? Math.min(input.timeout * 1000, 30_000)
           : 15_000;
-      // bash -c <cmd> — the command is passed as a single argument, not
-      // interpolated into a shell string, so the arg is injection-safe.
+      // bash -c <cmd> — the command is a single argument, not interpolated
+      // into a larger shell string.
       return runCommand("bash", ["-c", cmd], timeoutMs);
     }
 
@@ -135,7 +162,7 @@ async function executeTool(
       const path = (input.path ?? ".") as string;
       if (!pat) return "[resurrect: missing pattern]";
       const flagArg = input.case_insensitive ? "-rin" : "-rn";
-      // Use -- to terminate flag parsing; pattern and path are separate args.
+      // -- terminates flag parsing; pattern and path are separate args.
       const lines = runCommand("grep", [flagArg, "--", pat, path]).split("\n");
       return lines.slice(0, 500).join("\n");
     }
@@ -146,9 +173,12 @@ async function executeTool(
       const root = (input.path ?? ".") as string;
       if (!pat) return "[resurrect: missing pattern]";
       // Bun.Glob handles **, ?, [...] correctly — find -name does not.
+      // absolute: true avoids ambiguity about which directory relative paths
+      // are relative to (resurrect may run from a different cwd than the
+      // original session).
       const glob = new Bun.Glob(pat);
       const matches: string[] = [];
-      for await (const file of glob.scan({ cwd: root, dot: true })) {
+      for await (const file of glob.scan({ cwd: root, dot: true, absolute: true })) {
         matches.push(file);
         if (matches.length >= 500) break;
       }
@@ -165,18 +195,7 @@ async function executeTool(
       if (!url) return null;
       // curl args are a list — url is not interpolated into a shell string.
       const raw = runCommand("curl", ["-sL", "--max-time", "10", url]);
-      // Strip markup so the model sees readable text, not raw HTML.
-      return raw
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 50_000);
+      return stripHtml(raw);
     }
 
     // Side-effect or time-sensitive — never re-execute.
@@ -198,16 +217,34 @@ async function executeTool(
 // -- Session discovery --------------------------------------------------------
 
 /**
+ * Read up to maxBytes from the start of a file without loading it all.
+ * The tail may be a truncated UTF-8 sequence or partial JSON line; callers
+ * must tolerate parse errors on the last element.
+ */
+function readHead(path: string, maxBytes: number): string {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    const n = readSync(fd, buf, 0, maxBytes, 0);
+    return buf.subarray(0, n).toString("utf-8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * Return true if the session looks like an interactive (main-thread) session:
- * at least one user message in the first 30 lines contains a text block
- * (human input), not only tool_result blocks.
+ * at least one user message in the first 4 KB contains a text block (human
+ * input), not only tool_result blocks.
  *
  * Subagent sessions (session_memory, prompt_suggestion, etc.) consist almost
  * entirely of tool_use / tool_result pairs and have no plain-text user turns.
+ * Reading only the head avoids loading large session files in full.
  */
-function isInteractiveSession(path: string): boolean {
+export function isInteractiveSession(path: string): boolean {
   try {
-    const lines = readFileSync(path, "utf-8").trim().split("\n").slice(0, 30);
+    const head = readHead(path, INTERACTIVE_SCAN_BYTES);
+    const lines = head.split("\n");
     for (const line of lines) {
       try {
         const obj = JSON.parse(line) as SessionLine;
@@ -217,7 +254,7 @@ function isInteractiveSession(path: string): boolean {
           }
         }
       } catch {
-        // skip unparseable lines
+        // truncated or unparseable line — skip
       }
     }
     return false;
@@ -226,7 +263,7 @@ function isInteractiveSession(path: string): boolean {
   }
 }
 
-function getAllSessions(): { path: string; mtime: number; interactive: boolean }[] {
+export function getAllSessions(): { path: string; mtime: number; interactive: boolean }[] {
   const sessions: { path: string; mtime: number; interactive: boolean }[] = [];
   if (!existsSync(CLAUDE_PROJECTS)) return sessions;
   for (const proj of readdirSync(CLAUDE_PROJECTS)) {
@@ -236,7 +273,11 @@ function getAllSessions(): { path: string; mtime: number; interactive: boolean }
         if (!file.endsWith(".jsonl")) continue;
         const fp = join(projPath, file);
         const { mtimeMs } = statSync(fp);
-        sessions.push({ path: fp, mtime: mtimeMs, interactive: isInteractiveSession(fp) });
+        sessions.push({
+          path: fp,
+          mtime: mtimeMs,
+          interactive: isInteractiveSession(fp),
+        });
       }
     } catch {
       // skip inaccessible project dirs
@@ -245,7 +286,7 @@ function getAllSessions(): { path: string; mtime: number; interactive: boolean }
   return sessions.sort((a, b) => b.mtime - a.mtime);
 }
 
-function findSession(override?: string): string {
+export function findSession(override?: string): string {
   if (override) {
     if (!existsSync(override)) throw new Error("File not found: " + override);
     return override;
@@ -260,7 +301,7 @@ function findSession(override?: string): string {
 
 // -- Session processor --------------------------------------------------------
 
-async function processSession(
+export async function processSession(
   sessionPath: string,
   opts: { dryRun: boolean; bash: boolean },
 ): Promise<void> {
@@ -379,19 +420,35 @@ async function processSession(
   }
 
   const backupPath = sessionPath + ".bak";
-  copyFileSync(sessionPath, backupPath);
+  if (existsSync(backupPath)) {
+    // Never overwrite an existing backup — the first one is the pristine
+    // original. If the user wants a fresh backup they can delete it manually.
+    console.error("\nBackup already exists (preserving original): " + backupPath.replace(homedir(), "~"));
+  } else {
+    copyFileSync(sessionPath, backupPath);
+    console.error("\nBackup:   " + backupPath.replace(homedir(), "~"));
+  }
+
   writeFileSync(
     sessionPath,
     updated.map((l) => JSON.stringify(l)).join("\n") + "\n",
   );
-  console.error("\nWritten:  " + rel);
-  console.error("Backup:   " + rel + ".bak");
+  console.error("Written:  " + rel);
 }
 
 // -- Entry point --------------------------------------------------------------
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // Migration: --skip-bash was removed; bash is off by default now.
+  if (args.includes("--skip-bash")) {
+    console.error(
+      "Note: --skip-bash is no longer needed. Bash re-execution is off by " +
+        "default.\nRemove --skip-bash from your command. Use --bash to opt in.",
+    );
+    process.exit(1);
+  }
 
   if (args.includes("--help") || args.includes("-h")) {
     console.log(
@@ -450,4 +507,6 @@ async function main(): Promise<void> {
   }
 }
 
-main();
+if (import.meta.main) {
+  main();
+}
