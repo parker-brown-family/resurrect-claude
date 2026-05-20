@@ -1,0 +1,12 @@
+{
+  "name": "resurrect",
+  "version": "0.1.0",
+  "description": "Restore cleared tool results in Claude Code sessions after time-based microcompaction",
+  "main": "index.ts",
+  "bin": {
+    "resurrect": "index.ts"
+  },
+  "scripts": {
+    "start": "bun run index.ts"
+  }
+}
