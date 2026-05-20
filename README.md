@@ -2,6 +2,13 @@
 
 Restore cleared tool results in a Claude Code session after time-based microcompaction.
 
+> **Scope:** resurrect only helps when the `tengu_slate_heron` GrowthBook
+> flag is active in your Claude Code build. That flag is **disabled by
+> default**. If you run `/resurrect` and see "Nothing to resurrect", your
+> session is using the standard cached-MC path — which never touches the
+> local JSONL at all and cannot be undone by this tool. See
+> [When this applies](#when-this-applies) for the full picture.
+
 ## Install
 
 **Requirements:** [Bun](https://bun.sh), [Claude Code](https://claude.ai/code)
@@ -75,14 +82,26 @@ contents instead of cleared markers.
 
 Claude Code has two context-trimming paths:
 
-**Cached microcompact** (the default): Uses the cache-editing API to remove old
-tool results server-side without touching the local session file. The JSONL is
-never modified. This is what most users run — resurrect is a no-op here.
+### Cached microcompact — the default, resurrect cannot help here
 
-**Time-based microcompact** (opt-in via GrowthBook flag `tengu_slate_heron`,
-disabled by default): Fires when the gap since the last assistant message
-exceeds a threshold (default 60 min), indicating the server-side prompt cache
-has expired. It walks every tool result and replaces old content with:
+The standard path uses the cache-editing API (`cache_edits` blocks) to delete
+old tool results from the server-side cache. **It never modifies the local
+JSONL.** The file on disk stays intact, so resurrect finds nothing to restore
+and reports "Nothing to resurrect."
+
+This is what causes the "Claude feels dumber after I've been away for a while"
+experience most people notice. After coming back to a long session, old file
+reads and grep outputs have been pruned from the server's view of the
+conversation — but the JSONL shows no trace of it. Resurrect cannot reverse
+this because there is nothing written locally to reverse.
+
+### Time-based microcompact — the path resurrect covers
+
+Controlled by the `tengu_slate_heron` GrowthBook flag, **disabled by default**.
+Fires when the gap since the last assistant message exceeds a threshold (default
+60 min), indicating the server-side prompt cache has expired. Unlike cached MC,
+this path **writes directly to the JSONL** — it walks every tool result and
+replaces old content with:
 
 ```
 [Old tool result content cleared]
@@ -92,9 +111,9 @@ Every file read, grep output, bash result, and glob listing from the old part
 of the session becomes that single string. The model can still see it ran a
 `Read` on `src/index.ts` — it just cannot see what was in that file.
 
-`resurrect` only does anything when the time-based path has fired. If you do
-not see `[Old tool result content cleared]` in your session, there is nothing
-to resurrect.
+This is the only path resurrect can fix. If you do not see
+`[Old tool result content cleared]` in your session file, the time-based path
+never ran and there is nothing to restore.
 
 ## How it works
 
