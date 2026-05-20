@@ -2,69 +2,41 @@
 
 Restore cleared tool results in a Claude Code session after time-based microcompaction.
 
-## The problem
+## When this applies
 
-When you return to a Claude Code session after an hour or more away, the responses feel
-noticeably worse -- slower, less aware of the codebase, like the model forgot what it was
-doing. It is easy to blame the model. The real cause is deliberate and surgical.
+Claude Code has two context-trimming paths:
 
-Anthropic's prompt cache has a 1-hour TTL. When Claude Code detects that the cache has
-gone cold, it runs a **time-based microcompact** before sending the next request. This
-function walks every tool result in the conversation and replaces the content of all but
-the last few with a single marker string:
+**Cached microcompact** (the default): Uses the cache-editing API to remove old
+tool results server-side without touching the local session file. The JSONL is
+never modified. This is what most users run.
 
-```ts
-function maybeTimeBasedMicrocompact(
-  messages: Message[],
-  querySource: QuerySource | undefined,
-): MicrocompactResult | null {
-  const trigger = evaluateTimeBasedTrigger(messages, querySource)
-  if (!trigger) {
-    return null
-  }
+**Time-based microcompact** (opt-in via GrowthBook flag `tengu_slate_heron`,
+disabled by default): Fires when the gap since the last assistant message
+exceeds a threshold (default 60 min), indicating the server-side prompt cache
+has expired. It walks every tool result and replaces old content with a marker:
 
-  ...
-
-  let tokensSaved = 0
-  const result: Message[] = messages.map(message => {
-    if (message.type !== 'user' || !Array.isArray(message.message.content))
-    let touched = false
-    const newContent = message.message.content.map(block => {
-      if (
-        block.type === 'tool_result' &&
-        clearSet.has(block.tool_use_id) &&
-        block.content !== TIME_BASED_MC_CLEARED_MESSAGE
-      ) {
-        tokensSaved += calculateToolResultTokens(block)
-        touched = true
-        return { ...block, content: TIME_BASED_MC_CLEARED_MESSAGE }
-      }
-      return block
-    })
-  })
-}
+```
+[Old tool result content cleared]
 ```
 
-Every file read, grep output, bash result, and glob listing from the old part of the
-session is replaced with `[Old tool result content cleared]`. The model can still
-see that it ran a `Read` on `src/index.ts` two hours ago -- it just can no
-longer see what was in that file.
+Every file read, grep output, bash result, and glob listing from the old part
+of the session becomes that single string. The model can still see it ran a
+`Read` on `src/index.ts` — it just cannot see what was in that file.
 
-This is a reasonable cost tradeoff. Re-uploading megabytes of stale tool output that
-will not hit the cache is wasteful. But the side effect is that Claude is now working
-from a sketch of the session rather than the session itself.
+`resurrect` only does anything when the time-based path has fired. If you do
+not see `[Old tool result content cleared]` in your session, nothing here
+applies.
 
 ## The solution
 
-The compaction only clears `tool_result` content. The `tool_use` blocks -- the
-original tool calls with their names and inputs -- are never touched. Every cleared
-result has a surviving `tool_use` that says exactly what was called and with what
-arguments.
+The compaction only clears `tool_result` content. The `tool_use` blocks — the
+original calls with their names and inputs — are never touched. Every cleared
+result has a surviving `tool_use` that records exactly what was called and
+with what arguments.
 
 `resurrect` walks the session JSONL, builds a map of
-`tool_use_id -> { name, input }`, finds every result carrying
-`[Old tool result content cleared]`, re-executes the original call, and writes the
-real output back into the file.
+`tool_use_id → { name, input }`, finds every result carrying the cleared
+marker, re-executes the original call, and writes the real output back.
 
 ```
 Session: ~/.claude/projects/-home-pbrown-myproject/abc123.jsonl
@@ -76,28 +48,36 @@ Session: ~/.claude/projects/-home-pbrown-myproject/abc123.jsonl
 
 Resurrected: 4  Skipped: 1
 
+Warning: resurrected output reflects current on-disk state, not session state.
+Files or command outputs may have changed since the original tool call.
+
 Written:  ~/.claude/projects/-home-pbrown-myproject/abc123.jsonl
 Backup:   ~/.claude/projects/-home-pbrown-myproject/abc123.jsonl.bak
 ```
 
-Reopen Claude Code and it loads the restored session. The model has the actual data again.
+Reopen Claude Code and it loads the restored session.
+
+**State drift caveat**: re-executed output reflects current disk state, not
+state at the time of the original call. If Claude edited files during the
+session, the resurrected Read will show the post-edit version — which is
+usually what you want, but is not a perfect replay of history.
 
 ## Usage
 
 ```bash
-# Auto-find the most recently modified session and restore it
+# Auto-find the most recently modified interactive session and restore it
 bun run ~/Projects/resurrect/index.ts
 
 # Preview what would be restored without writing anything
 bun run ~/Projects/resurrect/index.ts --dry-run
 
-# Skip re-running Bash commands (restore only reads/greps/globs)
-bun run ~/Projects/resurrect/index.ts --skip-bash
+# Also re-run Bash commands (off by default — commands may be destructive)
+bun run ~/Projects/resurrect/index.ts --bash
 
 # Target a specific session file
 bun run ~/Projects/resurrect/index.ts ~/.claude/projects/.../session.jsonl
 
-# List all sessions, newest first
+# List all sessions, newest first (~ marks likely subagent sessions)
 bun run ~/Projects/resurrect/index.ts --list
 ```
 
@@ -106,16 +86,33 @@ bun run ~/Projects/resurrect/index.ts --list
 | Tool | Action |
 |------|--------|
 | `Read` | Re-reads the file from disk |
-| `Bash` | Re-runs the command (skip with `--skip-bash`) |
+| `Bash` | Re-runs the command (requires `--bash`) |
 | `Grep` | Re-runs the grep |
-| `Glob` | Re-runs the find |
+| `Glob` | Re-scans with Bun.Glob (handles `**` correctly) |
 | `LS` | Re-runs ls |
-| `WebFetch` | Re-fetches the URL via curl |
-| `Write`, `Edit`, `TodoWrite`, `WebSearch` | Skipped -- side effects or time-sensitive |
+| `WebFetch` | Re-fetches and strips HTML markup |
+| `Write`, `Edit`, `TodoWrite`, `WebSearch` | Skipped — side effects or time-sensitive |
+
+Bash is off by default because commands from old sessions can be destructive
+(`git reset --hard`, deployment scripts, etc.) and may produce wrong output
+if state has changed. Use `--bash` only when you know the session's commands
+are safe to replay.
 
 The original `.jsonl` is backed up as `.jsonl.bak` before any write.
+
+## Session auto-discovery
+
+When no session file is given, `resurrect` picks the most recently modified
+session that looks interactive (has at least one plain-text user turn, not only
+tool results). This filters out subagent sessions — short-lived background
+agents that Claude Code spins up internally and that are often modified more
+recently than the main session.
+
+Use `--list` to see all sessions. The `~` prefix marks likely subagent sessions.
 
 ## Requirements
 
 - [Bun](https://bun.sh) runtime
 - Claude Code sessions in `~/.claude/projects/` (default location)
+- `tengu_slate_heron` GrowthBook flag enabled in your Claude Code build
+  (this is what causes the cleared markers to appear in the first place)
