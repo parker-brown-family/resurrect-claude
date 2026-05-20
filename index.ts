@@ -2,17 +2,35 @@
 /**
  * resurrect -- restore cleared tool results in Claude Code sessions
  *
- * Claude Code time-based microcompact replaces old tool result content with
- * "[Old tool result content cleared]" when the 1-hour KV cache TTL expires.
- * This tool re-executes the original tool calls and writes real output back.
+ * When the tengu_slate_heron GrowthBook flag is enabled, Claude Code's
+ * time-based microcompact replaces old tool result content with
+ * "[Old tool result content cleared]" when the server-side prompt cache TTL
+ * (1 hour) expires. This tool re-executes the original tool calls and writes
+ * the real output back into the session file.
+ *
+ * IMPORTANT: time-based MC is DISABLED by default. The standard cached-MC
+ * path (used by most users) never modifies the JSONL — only time-based MC
+ * does. If you see no "[Old tool result content cleared]" markers, nothing
+ * here applies.
+ *
+ * Resurrected output reflects CURRENT state, not state at session time.
+ * Bash re-execution is OFF by default (pass --bash to enable — commands may
+ * be destructive or state-dependent).
  *
  * Usage:
- *   bun run index.ts [session.jsonl] [--dry-run] [--skip-bash]
+ *   bun run index.ts [session.jsonl] [--dry-run] [--bash]
  *   bun run index.ts --list
  *   bun run index.ts --help
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, copyFileSync } from "fs";
+import {
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  statSync,
+  existsSync,
+  copyFileSync,
+} from "fs";
 import { join } from "path";
 import { spawnSync } from "child_process";
 import { homedir } from "os";
@@ -36,7 +54,10 @@ interface ToolResultBlock {
   [k: string]: unknown;
 }
 
-type ContentBlock = ToolUseBlock | ToolResultBlock | { type: string; [k: string]: unknown };
+type ContentBlock =
+  | ToolUseBlock
+  | ToolResultBlock
+  | { type: string; [k: string]: unknown };
 
 interface SessionLine {
   type?: string;
@@ -44,102 +65,121 @@ interface SessionLine {
   [k: string]: unknown;
 }
 
-// -- Session discovery --------------------------------------------------------
+// -- Shell execution (injection-safe) -----------------------------------------
 
-function getAllSessions(): { path: string; mtime: number }[] {
-  const sessions: { path: string; mtime: number }[] = [];
-  if (!existsSync(CLAUDE_PROJECTS)) return sessions;
-  for (const proj of readdirSync(CLAUDE_PROJECTS)) {
-    const projPath = join(CLAUDE_PROJECTS, proj);
-    try {
-      for (const file of readdirSync(projPath)) {
-        if (!file.endsWith(".jsonl")) continue;
-        const fp = join(projPath, file);
-        const { mtimeMs } = statSync(fp);
-        sessions.push({ path: fp, mtime: mtimeMs });
-      }
-    } catch {}
-  }
-  return sessions.sort((a, b) => b.mtime - a.mtime);
-}
-
-function findSession(override?: string): string {
-  if (override) {
-    if (!existsSync(override)) throw new Error("File not found: " + override);
-    return override;
-  }
-  const sessions = getAllSessions();
-  if (sessions.length === 0) throw new Error("No sessions found in " + CLAUDE_PROJECTS);
-  return sessions[0].path;
-}
-
-// -- Tool execution -----------------------------------------------------------
-
-function runShell(command: string, timeoutMs = 15_000): string {
-  const result = spawnSync("bash", ["-c", command], {
+/**
+ * Run a command with an explicit argument list — no shell interpolation.
+ * Stdout and stderr are combined; non-zero exit is surfaced in the output.
+ */
+function runCommand(
+  cmd: string,
+  args: string[],
+  timeoutMs = 15_000,
+): string {
+  const result = spawnSync(cmd, args, {
     encoding: "utf-8",
     timeout: timeoutMs,
     maxBuffer: 10 * 1024 * 1024,
   });
-  const combined = ((result.stdout ?? "") + (result.stderr ?? "")).trimEnd();
-  if (result.status !== 0) {
-    return ("Exit code " + (result.status ?? 1) + "\n" + combined).trimEnd();
+  if (result.error) {
+    return "[resurrect: exec error — " + result.error.message + "]";
   }
-  return combined;
+  const out = (result.stdout ?? "").trimEnd();
+  const err = (result.stderr ?? "").trimEnd();
+  if (result.status !== 0) {
+    return (
+      "Exit code " +
+      (result.status ?? 1) +
+      (out ? "\n" + out : "") +
+      (err ? "\n" + err : "")
+    ).trimEnd();
+  }
+  return out || err;
 }
 
-// Tools the microcompact source marks compactable:
-// Read, Bash (shell tools), Grep, Glob, WebSearch, WebFetch, Edit, Write
-function executeTool(
+// -- Tool execution -----------------------------------------------------------
+
+async function executeTool(
   name: string,
   input: Record<string, unknown>,
-  opts: { skipBash: boolean }
-): string | null {
+  opts: { bash: boolean },
+): Promise<string | null> {
   switch (name) {
     case "Read":
     case "FileRead": {
-      const fp = (input.file_path ?? input.path) as string;
+      const fp = (input.file_path ?? input.path) as string | undefined;
       if (!fp) return "[resurrect: missing file_path]";
-      try { return readFileSync(fp, "utf-8"); }
-      catch (e: any) { return "[resurrect: read failed -- " + e.message + "]"; }
+      try {
+        return readFileSync(fp, "utf-8");
+      } catch (e: any) {
+        return "[resurrect: read failed — " + e.message + "]";
+      }
     }
 
     case "Bash": {
-      if (opts.skipBash) return null;
-      const cmd = input.command as string;
+      if (!opts.bash) return null;
+      const cmd = input.command as string | undefined;
       if (!cmd) return null;
-      const timeoutMs = typeof input.timeout === "number"
-        ? Math.min(input.timeout * 1000, 30_000)
-        : 15_000;
-      return runShell(cmd, timeoutMs);
+      const timeoutMs =
+        typeof input.timeout === "number"
+          ? Math.min(input.timeout * 1000, 30_000)
+          : 15_000;
+      // bash -c <cmd> — the command is passed as a single argument, not
+      // interpolated into a shell string, so the arg is injection-safe.
+      return runCommand("bash", ["-c", cmd], timeoutMs);
     }
 
     case "Grep":
     case "GrepTool": {
-      const pat = (input.pattern as string ?? "").replace(/"/g, "\"");
+      const pat = input.pattern as string | undefined;
       const path = (input.path ?? ".") as string;
-      const flags = input.case_insensitive ? "-rin" : "-rn";
-      return runShell("grep " + flags + " \"" + pat + "\" \"" + path + "\" 2>/dev/null | head -500");
+      if (!pat) return "[resurrect: missing pattern]";
+      const flagArg = input.case_insensitive ? "-rin" : "-rn";
+      // Use -- to terminate flag parsing; pattern and path are separate args.
+      const lines = runCommand("grep", [flagArg, "--", pat, path]).split("\n");
+      return lines.slice(0, 500).join("\n");
     }
 
     case "Glob":
     case "GlobTool": {
-      const pat = input.pattern as string;
-      const path = (input.path ?? ".") as string;
-      return runShell("find \"" + path + "\" -name \"" + pat + "\" 2>/dev/null | head -500");
+      const pat = input.pattern as string | undefined;
+      const root = (input.path ?? ".") as string;
+      if (!pat) return "[resurrect: missing pattern]";
+      // Bun.Glob handles **, ?, [...] correctly — find -name does not.
+      const glob = new Bun.Glob(pat);
+      const matches: string[] = [];
+      for await (const file of glob.scan({ cwd: root, dot: true })) {
+        matches.push(file);
+        if (matches.length >= 500) break;
+      }
+      return matches.join("\n") || "(no matches)";
     }
 
     case "LS": {
-      return runShell("ls -la \"" + (input.path ?? ".") + "\" 2>&1");
+      const path = (input.path ?? ".") as string;
+      return runCommand("ls", ["-la", path]);
     }
 
     case "WebFetch": {
-      const url = input.url as string;
+      const url = input.url as string | undefined;
       if (!url) return null;
-      return runShell("curl -sL --max-time 10 \"" + url + "\" | head -c 50000");
+      // curl args are a list — url is not interpolated into a shell string.
+      const raw = runCommand("curl", ["-sL", "--max-time", "10", url]);
+      // Strip markup so the model sees readable text, not raw HTML.
+      return raw
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 50_000);
     }
 
-    // Write/edit tools -- do not re-run (side effects; state already changed)
+    // Side-effect or time-sensitive — never re-execute.
     case "Write":
     case "Edit":
     case "MultiEdit":
@@ -155,12 +195,75 @@ function executeTool(
   }
 }
 
+// -- Session discovery --------------------------------------------------------
+
+/**
+ * Return true if the session looks like an interactive (main-thread) session:
+ * at least one user message in the first 30 lines contains a text block
+ * (human input), not only tool_result blocks.
+ *
+ * Subagent sessions (session_memory, prompt_suggestion, etc.) consist almost
+ * entirely of tool_use / tool_result pairs and have no plain-text user turns.
+ */
+function isInteractiveSession(path: string): boolean {
+  try {
+    const lines = readFileSync(path, "utf-8").trim().split("\n").slice(0, 30);
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as SessionLine;
+        if (obj.type === "user" && Array.isArray(obj.message?.content)) {
+          for (const block of obj.message.content as ContentBlock[]) {
+            if (block.type === "text") return true;
+          }
+        }
+      } catch {
+        // skip unparseable lines
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function getAllSessions(): { path: string; mtime: number; interactive: boolean }[] {
+  const sessions: { path: string; mtime: number; interactive: boolean }[] = [];
+  if (!existsSync(CLAUDE_PROJECTS)) return sessions;
+  for (const proj of readdirSync(CLAUDE_PROJECTS)) {
+    const projPath = join(CLAUDE_PROJECTS, proj);
+    try {
+      for (const file of readdirSync(projPath)) {
+        if (!file.endsWith(".jsonl")) continue;
+        const fp = join(projPath, file);
+        const { mtimeMs } = statSync(fp);
+        sessions.push({ path: fp, mtime: mtimeMs, interactive: isInteractiveSession(fp) });
+      }
+    } catch {
+      // skip inaccessible project dirs
+    }
+  }
+  return sessions.sort((a, b) => b.mtime - a.mtime);
+}
+
+function findSession(override?: string): string {
+  if (override) {
+    if (!existsSync(override)) throw new Error("File not found: " + override);
+    return override;
+  }
+  const sessions = getAllSessions();
+  if (sessions.length === 0)
+    throw new Error("No sessions found in " + CLAUDE_PROJECTS);
+  // Prefer the most-recently-modified interactive session.
+  const interactive = sessions.find((s) => s.interactive);
+  return (interactive ?? sessions[0]).path;
+}
+
 // -- Session processor --------------------------------------------------------
 
-function processSession(
+async function processSession(
   sessionPath: string,
-  opts: { dryRun: boolean; skipBash: boolean }
-): void {
+  opts: { dryRun: boolean; bash: boolean },
+): Promise<void> {
   const rel = sessionPath.replace(homedir(), "~");
   console.error("Session: " + rel + "\n");
 
@@ -169,18 +272,21 @@ function processSession(
     .trim()
     .split("\n")
     .map((l, i) => {
-      try { return JSON.parse(l); }
-      catch (e) { throw new Error("JSON parse error on line " + (i + 1) + ": " + e); }
+      try {
+        return JSON.parse(l);
+      } catch (e) {
+        throw new Error("JSON parse error on line " + (i + 1) + ": " + e);
+      }
     });
 
-  // Build tool_use id -> block map from all assistant messages
+  // Build tool_use id → block map from all assistant messages.
   const toolUseMap = new Map<string, ToolUseBlock>();
   for (const line of lines) {
     const msg = line.message;
     if (!msg || !Array.isArray(msg.content)) continue;
     for (const block of msg.content as ContentBlock[]) {
       if (block.type === "tool_use") {
-        toolUseMap.set(block.id, block as ToolUseBlock);
+        toolUseMap.set((block as ToolUseBlock).id, block as ToolUseBlock);
       }
     }
   }
@@ -188,102 +294,156 @@ function processSession(
   let resurrected = 0;
   let skipped = 0;
 
-  const updated: SessionLine[] = lines.map((line) => {
+  const updated: SessionLine[] = [];
+  for (const line of lines) {
     const msg = line.message;
-    if (!msg || line.type !== "user" || !Array.isArray(msg.content)) return line;
+    if (!msg || line.type !== "user" || !Array.isArray(msg.content)) {
+      updated.push(line);
+      continue;
+    }
 
     let touched = false;
-    const newContent = (msg.content as ContentBlock[]).map((block) => {
-      if (block.type !== "tool_result") return block;
+    const newContent: ContentBlock[] = [];
+    for (const block of msg.content as ContentBlock[]) {
+      if (block.type !== "tool_result") {
+        newContent.push(block);
+        continue;
+      }
       const result = block as ToolResultBlock;
-      if (result.content !== CLEARED) return block;
+      if (result.content !== CLEARED) {
+        newContent.push(block);
+        continue;
+      }
 
       const toolUse = toolUseMap.get(result.tool_use_id);
       if (!toolUse) {
         console.error("  !  No tool_use found for " + result.tool_use_id);
         skipped++;
-        return block;
+        newContent.push(block);
+        continue;
       }
 
-      const restored = executeTool(toolUse.name, toolUse.input, opts);
+      const restored = await executeTool(toolUse.name, toolUse.input, opts);
       if (restored === null) {
-        console.error("  o  " + toolUse.name + " -- skipped (not safe to re-execute)");
+        const reason =
+          toolUse.name === "Bash" && !opts.bash
+            ? "skipped (pass --bash to enable)"
+            : "skipped (not safe to re-execute)";
+        console.error("  o  " + toolUse.name.padEnd(12) + " -- " + reason);
         skipped++;
-        return block;
+        newContent.push(block);
+        continue;
       }
 
       resurrected++;
       const preview = restored.slice(0, 72).replace(/\n/g, "~");
-      const nameCol = toolUse.name.padEnd(12);
-      const lenCol = restored.length.toString().padStart(6);
-      console.error("  +  " + nameCol + lenCol + " chars  \"" + preview + "\"");
+      console.error(
+        "  +  " +
+          toolUse.name.padEnd(12) +
+          restored.length.toString().padStart(6) +
+          ' chars  "' +
+          preview +
+          '"',
+      );
       touched = true;
-      return Object.assign({}, result, { content: restored });
-    });
+      newContent.push(Object.assign({}, result, { content: restored }));
+    }
 
-    if (!touched) return line;
-    return Object.assign({}, line, { message: Object.assign({}, msg, { content: newContent }) });
-  });
+    if (!touched) {
+      updated.push(line);
+    } else {
+      updated.push(
+        Object.assign({}, line, {
+          message: Object.assign({}, msg, { content: newContent }),
+        }),
+      );
+    }
+  }
 
   console.error("\nResurrected: " + resurrected + "  Skipped: " + skipped);
 
   if (resurrected === 0) {
-    console.error("Nothing to resurrect -- all tool results are already live.");
+    console.error("Nothing to resurrect — all tool results are already live.");
     return;
   }
 
+  console.error(
+    "\nWarning: resurrected output reflects current on-disk state, not " +
+      "session state.\nFiles or command outputs may have changed since the " +
+      "original tool call.",
+  );
+
   if (opts.dryRun) {
-    console.error("(dry run -- nothing written)");
+    console.error("\n(dry run — nothing written)");
     return;
   }
 
   const backupPath = sessionPath + ".bak";
   copyFileSync(sessionPath, backupPath);
-  writeFileSync(sessionPath, updated.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  writeFileSync(
+    sessionPath,
+    updated.map((l) => JSON.stringify(l)).join("\n") + "\n",
+  );
   console.error("\nWritten:  " + rel);
   console.error("Backup:   " + rel + ".bak");
 }
 
 // -- Entry point --------------------------------------------------------------
 
-function main(): void {
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
   if (args.includes("--help") || args.includes("-h")) {
     console.log(
-      "resurrect -- restore cleared Claude Code tool results\n" +
-      "\nUsage:" +
-      "\n  bun run index.ts [session.jsonl] [--dry-run] [--skip-bash]" +
-      "\n  bun run index.ts --list" +
-      "\n\nOptions:" +
-      "\n  --dry-run    Show what would be restored, do not write" +
-      "\n  --skip-bash  Skip Bash tool re-execution (safe mode)" +
-      "\n  --list       List all sessions, newest first" +
-      "\n  --help       Show this help" +
-      "\n\nIf no session file is given, uses the most recently modified session" +
-      "\nin ~/.claude/projects/."
+      "resurrect — restore cleared Claude Code tool results\n" +
+        "\nUsage:" +
+        "\n  bun run index.ts [session.jsonl] [--dry-run] [--bash]" +
+        "\n  bun run index.ts --list" +
+        "\n\nOptions:" +
+        "\n  --dry-run  Show what would be restored; do not write" +
+        "\n  --bash     Re-execute Bash commands (off by default — commands may be destructive)" +
+        "\n  --list     List all sessions, newest first" +
+        "\n  --help     Show this help" +
+        "\n\nIf no session file is given, uses the most recently modified interactive" +
+        "\nsession in ~/.claude/projects/." +
+        "\n\nOnly fires when Claude Code's time-based microcompact has run" +
+        "\n(tengu_slate_heron GrowthBook flag, disabled by default). The standard" +
+        "\ncached-MC path never modifies the session JSONL.",
     );
     return;
   }
 
   if (args.includes("--list")) {
     const sessions = getAllSessions();
-    if (sessions.length === 0) { console.log("No sessions found."); return; }
-    for (const { path, mtime } of sessions.slice(0, 30)) {
-      const age = Math.round((Date.now() - mtime) / 60_000);
-      const ageStr = age < 60 ? age + "m" : age < 1440 ? Math.round(age / 60) + "h" : Math.round(age / 1440) + "d";
-      console.log(ageStr.padStart(5) + "  " + path.replace(homedir(), "~"));
+    if (sessions.length === 0) {
+      console.log("No sessions found.");
+      return;
     }
+    for (const { path, mtime, interactive } of sessions.slice(0, 30)) {
+      const age = Math.round((Date.now() - mtime) / 60_000);
+      const ageStr =
+        age < 60
+          ? age + "m"
+          : age < 1440
+            ? Math.round(age / 60) + "h"
+            : Math.round(age / 1440) + "d";
+      // ~ marks subagent sessions (no interactive text turns)
+      const marker = interactive ? " " : "~";
+      console.log(
+        ageStr.padStart(5) + marker + " " + path.replace(homedir(), "~"),
+      );
+    }
+    console.error("\n~ = likely subagent session (no interactive user turns)");
     return;
   }
 
   const dryRun = args.includes("--dry-run");
-  const skipBash = args.includes("--skip-bash");
+  const bash = args.includes("--bash");
   const sessionArg = args.find((a) => !a.startsWith("--"));
 
   try {
     const sessionPath = findSession(sessionArg);
-    processSession(sessionPath, { dryRun, skipBash });
+    await processSession(sessionPath, { dryRun, bash });
   } catch (e: any) {
     console.error("Error: " + e.message);
     process.exit(1);
